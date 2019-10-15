@@ -1,0 +1,163 @@
+1. Build control nodes (x3) with CentOS minimal image
+2. Build worker nodes (min 1) with CentOS minimal image
+3. Build etcd nodes (x3)
+3. Verify unique product UUID
+	sudo cat /sys/class/dmi/id/product_uuid
+4. Disable swap on all nodes;
+	sudo swapoff -a
+	remove swap line in /etc/fstab
+5. Update and prepare yum
+	sudo yum update
+	sudo yum install -y yum-utils device-mapper-persistent-data lvm2
+	sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+6. Install latest supported docker release
+	sudo yum list docker-ce --showduplicates | sort -r (see what versions are available from Docker repo)
+	(check latest supported version from Kubernetes release notes)
+	sudo yum install docker-ce-18.09.8 (install latest release of supported version)
+7. Start docker and enable on boot
+	sudo systemctl start docker
+	sudo systemctl enable docker
+8. Setup Docker daemon
+	sudo mkdir /etc/docker
+	cat > /etc/docker/daemon.json <<EOF
+	{
+	  "exec-opts": ["native.cgroupdriver=systemd"],
+	  "log-driver": "json-file",
+	  "log-opts": {
+	    "max-size": "100m"
+	  },
+	  "storage-driver": "overlay2",
+	  "storage-opts": [
+	    "overlay2.override_kernel_check=true"
+	  ]
+	}
+	EOF
+	sudo mkdir -p /etc/systemd/system/docker.service.d
+	systemctl daemon-reload
+	systemctl restart docker
+9. Prepare yum for Kubernetes
+	cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+	[kubernetes]
+	name=Kubernetes
+	baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+	enabled=1
+	gpgcheck=1
+	repo_gpgcheck=1
+	gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+	EOF
+10. Disable SE Linux
+	sudo setenforce 0
+	sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+11. Install Kubernetes
+	sudo yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+	sudo systemctl enable --now kubelet
+12. Fix for iptables
+	sudo cat <<EOF >  /etc/sysctl.d/k8s.conf
+	net.bridge.bridge-nf-call-ip6tables = 1
+	net.bridge.bridge-nf-call-iptables = 1
+	EOF
+	sysctl --system
+13. Prepare yum for VMware Essentials PKS
+	sudo cat <<EOF > /etc/yum.repos.d/essential-pks.repo
+	[essential-pks]
+	name=VMware Essential PKS
+	baseurl=https://downloads.heptio.com/essential-pks/523a448aa3e9a0ef93ff892dceefee0a/rpms
+	enabled=1
+	gpgcheck=1
+	repo_gpgcheck=1
+	gpgkey=https://packages.vmware.com/tools/keys/VMWARE-PACKAGING-GPG-RSA-KEY.pub
+	exclude=kube*
+	EOF
+14. Install VMware Essentials PKS
+	K8S_VERSION=1.15.1-1.el7.vmware.2
+	sudo yum -y install kubelet-$K8S_VERSION kubeadm-$K8S_VERSION kubectl-$K8S_VERSION --disableexcludes=essential-pks
+15. sudo yum install wget
+16. Create install script ~/install_script.sh
+	#!/bin/bash
+
+	set -e
+
+	K8S_VERSION=v1.15.1 #Update with versions 1.14.1, 1.13.6
+	CRI_VERSION=v1.14.0 #Update to v1.12.0 for k8s versions prior to 1.15
+	CNI_VERSION=v0.7.5 #Update your CNI based on version numbers
+
+	# Create locations for binaries and the unit-file to reside
+	sudo mkdir -p /opt/bin
+	sudo mkdir -p /opt/cni/bin
+	sudo mkdir -p /etc/systemd/system/kubelet.service.d
+
+	BASE_URL='https://downloads.heptio.com/essential-pks/523a448aa3e9a0ef93ff892dceefee0a/executables/'
+
+	sudo wget -P /opt/bin ${BASE_URL}kubernetes/${K8S_VERSION}%2Bvmware.2/kubeadm-linux-${K8S_VERSION}%2Bvmware.2.gz
+	sudo wget -P /opt/bin ${BASE_URL}kubernetes/${K8S_VERSION}%2Bvmware.2/kubectl-linux-${K8S_VERSION}%2Bvmware.2.gz
+	sudo wget -P /opt/bin ${BASE_URL}kubernetes/${K8S_VERSION}%2Bvmware.2/kubelet-linux-${K8S_VERSION}%2Bvmware.2.gz
+	sudo wget -P /opt/bin ${BASE_URL}cri-tools/${CRI_VERSION}%2Bvmware.1/crictl-${CRI_VERSION}%2Bvmware.1.gz
+
+	# Need to unzip and rename executables to be used properly
+	sudo gunzip -r /opt/bin
+	sudo mv /opt/bin/kubeadm-linux-${K8S_VERSION}+vmware.2 /opt/bin/kubeadm
+	sudo mv /opt/bin/kubectl-linux-${K8S_VERSION}+vmware.2 /opt/bin/kubectl
+	sudo mv /opt/bin/kubelet-linux-${K8S_VERSION}+vmware.2 /opt/bin/kubelet
+	sudo mv /opt/bin/crictl-${CRI_VERSION}+vmware.1 /opt/bin/crictl
+	sudo chmod +x /opt/bin/kubeadm
+	sudo chmod +x /opt/bin/kubectl
+	sudo chmod +x /opt/bin/kubelet
+	sudo chmod +x /opt/bin/crictl
+
+	# Need to place cni for kubelet differently
+	echo "Downloading CNI"
+	sudo wget -P /opt/cni/bin ${BASE_URL}cni-plugins/${CNI_VERSION}%2Bvmware.1/cni-plugins-${CNI_VERSION}%2Bvmware.1.tgz
+	sudo tar zxf /opt/cni/bin/cni-plugins-${CNI_VERSION}+vmware.1.tgz -C /opt/cni/bin
+
+
+	# Downloading and putting in place the systemd unit files for kubelet
+	curl -sSL "https://raw.githubusercontent.com/kubernetes/kubernetes/${K8S_VERSION}/build/debs/kubelet.service" | sed "s:/usr/bin:/opt/bin:g" > ~/kubelet.service
+	curl -sSL "https://raw.githubusercontent.com/kubernetes/kubernetes/${K8S_VERSION}/build/debs/10-kubeadm.conf"  | sed "s:/usr/bin:/opt/bin:g" > ~/10-kubeadm.conf
+
+	sudo cp ~/kubelet.service /etc/systemd/system/kubelet.service
+	sudo cp ~/10-kubeadm.conf /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+16. Modify permissions and run script
+	chmod 777 ~/install_script.sh
+	sudo ./install_script.sh
+17. Start Kubelet
+	sudo systemctl enable --now /etc/systemd/system/kubelet.service
+18. Run a local docker registry
+	docker run -d -p 5000:5000 --restart=always --name registry registry:2
+19. Setup docker image store script ~/docker_image_store.sh
+	#!/bin/bash
+
+	set -e
+
+	K8S_VERSION=v1.15.1 #Update for your k8s version
+	ETCD_VERSION=v3.3.10 #Update to v3.2.24 for k8s 1.13 and 1.12
+	COREDNS_VERSION=v1.3.1 #Update v.1.2.6 for k8s 1.13 and v1.2.2 for k8s 1.12
+	COREDNS_FIXED_VERSION=$(sed 's/v//g' <<< $COREDNS_VERSION) #Fixes CoreDNS name for standard manifest
+	ETCD_FIXED_VERSION=$(sed 's/v//g' <<< $ETCD_VERSION) #Fixes etcd name for standard manifest
+
+	declare -a image_list=("kubernetes/${K8S_VERSION}%2Bvmware.2/kube-proxy-${K8S_VERSION}_vmware.2"
+	                       "kubernetes/${K8S_VERSION}%2Bvmware.2/kube-apiserver-${K8S_VERSION}_vmware.2"
+	                       "kubernetes/${K8S_VERSION}%2Bvmware.2/kube-controller-manager-${K8S_VERSION}_vmware.2"
+	                       "kubernetes/${K8S_VERSION}%2Bvmware.2/kube-scheduler-${K8S_VERSION}_vmware.2"
+	                       "kubernetes/${K8S_VERSION}%2Bvmware.2/pause-3.1"
+	                       "etcd/${ETCD_VERSION}%2Bvmware.3/etcd-${ETCD_VERSION}_vmware.3" #Update to version _vmware.1 for k8s versions prior to 1.15
+	                       "coredns/${COREDNS_VERSION}%2Bvmware.3/coredns-${COREDNS_VERSION}_vmware.3") #Update to version _vmware.1 for k8s versions prior to 1.15
+
+	BASE_URL=https://downloads.heptio.com/essential-pks/523a448aa3e9a0ef93ff892dceefee0a/images/
+
+	for image in "${image_list[@]}"; do
+	    echo "Downloading ${image}";
+	    curl -s ${BASE_URL}${image}.tar.gz | gunzip -c | sudo docker load;
+	done
+
+	#Update the CoreDNS image so the default kubeadm manifests pick them up
+	docker tag vmware/coredns:${COREDNS_VERSION}_vmware.3 vmware/coredns:${COREDNS_FIXED_VERSION} #Update to version _vmware.1 for k8s versions prior to 1.15
+	docker tag vmware/etcd:${ETCD_VERSION}_vmware.3 vmware/etcd:${ETCD_FIXED_VERSION} #Update to version _vmware.1 for k8s versions prior to 1.15
+20. Modify and run script
+	chmod 777 ~/docker_image_store.sh
+	sudo ./docker_image_store.sh
+21. 
+
+
+
+
+
